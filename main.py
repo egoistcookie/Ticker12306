@@ -19,15 +19,15 @@ def main():
     
     if success:
         print("\n" + "=" * 60)
-        print("✓ 登录成功！")
+        print("[OK] 登录成功！")
         print("=" * 60)
         
         # 执行最终认证
         print("\n正在进行最终认证...")
         if login_client.uamtk_auth():
-            print("✓ 认证完成！")
+            print("[OK] 认证完成！")
         else:
-            print("⚠ 认证失败，但登录已成功")
+            print("[WARN] 认证失败，但扫码已成功")
         
         # 保存session供后续使用
         print(f"\n当前Cookies: {dict(session.cookies)}")
@@ -36,7 +36,7 @@ def main():
         return session
     else:
         print("\n" + "=" * 60)
-        print("✗ 登录失败！")
+        print("[FAIL] 登录失败！")
         print("=" * 60)
         print("请检查：")
         print("1. 用户名和密码是否正确")

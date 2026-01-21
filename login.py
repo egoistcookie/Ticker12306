@@ -12,8 +12,10 @@ from urllib.parse import urlencode
 import urllib3
 from config import (
     USERNAME, PASSWORD, PHONE, ID_CARD_LAST_FOUR,
-    BASE_URL, LOGIN_URL, INITIAL_COOKIES, HEADERS
+    BASE_URL, LOGIN_URL, INITIAL_COOKIES, HEADERS,
+    RAIL_DEVICEID, RAIL_EXPIRATION
 )
+import re
 
 # 禁用 SSL 警告（12306 的 SSL 证书可能有问题）
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -36,6 +38,10 @@ class Ticker12306Login:
         self.session.headers.update(HEADERS)
         self.session.cookies.update(INITIAL_COOKIES)
         self.session.verify = False  # 禁用 SSL 验证（仅用于12306）
+        # 可选：手动注入设备指纹Cookie（若从浏览器复制）
+        if RAIL_DEVICEID and RAIL_EXPIRATION:
+            self.session.cookies.set("RAIL_DEVICEID", RAIL_DEVICEID, domain="kyfw.12306.cn")
+            self.session.cookies.set("RAIL_EXPIRATION", RAIL_EXPIRATION, domain="kyfw.12306.cn")
         self.base_url = BASE_URL
         # 如果 ddddocr 可用，初始化 OCR
         if DDDDOCR_AVAILABLE:
@@ -175,6 +181,111 @@ class Ticker12306Login:
             captcha_answer: 验证码答案（如果已识别），None则自动识别
             max_retry: 最大重试次数
         """
+        # 2026起，12306网页版已经默认支持扫码/滑块登录。
+        # 优先走官方扫码登录流程，兼容旧的图形验证码流程（method="captcha"）。
+        return self.login_with_qr()  # 默认使用扫码登录
+    
+    def login_with_qr(self, poll_interval=2, timeout=180):
+        """使用官方扫码登录（手机12306扫描二维码）"""
+        # 初始化会话和登录配置
+        if not self.init_session():
+            print("会话初始化失败，请检查网络连接")
+            return False, None
+        if not self.init_conf():
+            print("登录配置获取失败，请稍后重试")
+            return False, None
+        
+        uuid, qr_path = self.create_qr_image()
+        if not uuid:
+            return False, None
+        
+        print(f"请使用12306手机App扫描二维码并确认登录（文件: {qr_path}）")
+        print("等待手机端确认...")
+        start = time.time()
+        while time.time() - start < timeout:
+            status = self.session.post(
+                f"{self.base_url}/passport/web/checkqr",
+                data={"uuid": uuid, "appid": "otn"},
+                timeout=10,
+                verify=False
+            )
+            if status.status_code != 200:
+                print(f"二维码状态查询失败，状态码: {status.status_code}")
+                time.sleep(poll_interval)
+                continue
+            
+            try:
+                res = status.json()
+            except ValueError:
+                print("二维码状态解析失败")
+                time.sleep(poll_interval)
+                continue
+            
+            code = str(res.get("result_code"))
+            if code == "0":
+                # 未识别/等待扫码
+                time.sleep(poll_interval)
+                continue
+            if code == "1":
+                print("已扫码，等待手机端确认授权...")
+                time.sleep(poll_interval)
+                continue
+            if code == "2":
+                print("扫码授权成功，正在完成登录...")
+                if self.uamtk_auth():
+                    return True, self.session
+                return False, None
+            if code == "3":
+                print("二维码已过期，重新获取...")
+                return self.login_with_qr(poll_interval, timeout)
+            
+            # 其他状态
+            print(f"二维码登录失败，状态码: {code}，信息: {res.get('result_message')}")
+            return False, None
+        
+        print("等待扫码超时，请重新运行后再试")
+        return False, None
+    
+    def init_conf(self):
+        """获取登录配置，确保关键Cookie就绪"""
+        try:
+            conf_url = f"{self.base_url}/otn/login/conf"
+            resp = self.session.get(conf_url, timeout=10, verify=False)
+            return resp.status_code == 200
+        except Exception as e:
+            print(f"登录配置获取异常: {str(e)}")
+            return False
+    
+    def create_qr_image(self):
+        """生成登录二维码并保存"""
+        try:
+            qr_url = f"{self.base_url}/passport/web/create-qr64"
+            resp = self.session.post(
+                qr_url,
+                data={"appid": "otn"},
+                timeout=10,
+                verify=False
+            )
+            if resp.status_code != 200:
+                print(f"获取二维码失败，状态码: {resp.status_code}")
+                return None, None
+            
+            data = resp.json()
+            if str(data.get("result_code")) != "0" or not data.get("image"):
+                print(f"获取二维码失败: {data.get('result_message')}")
+                return None, None
+            
+            image_bytes = base64.b64decode(data["image"])
+            filename = f"qr_{int(time.time())}.png"
+            with open(filename, "wb") as f:
+                f.write(image_bytes)
+            return data.get("uuid"), filename
+        except Exception as e:
+            print(f"生成二维码异常: {str(e)}")
+            return None, None
+    
+    def login_with_captcha(self, captcha_answer=None, max_retry=3):
+        """旧的图形验证码登录流程（若官方接口恢复可使用）"""
         # 先初始化会话
         if not self.init_session():
             print("会话初始化失败，请检查网络连接")
@@ -287,13 +398,85 @@ class Ticker12306Login:
         try:
             uamtk_url = f"{self.base_url}/passport/web/auth/uamtk"
             data = {'appid': 'otn'}
-            response = self.session.post(uamtk_url, data=data, timeout=10, verify=False)
+
+            # 12306 前端这里用的是 jsonp（浏览器跨域会变成 GET + callback），
+            # 直接 POST 在某些网络/风控条件下会被 302 到 error.html。
+            # 所以我们先尝试 POST（不跟随重定向，便于判断），失败再退回 JSONP GET。
+            response = self.session.post(
+                uamtk_url,
+                data=data,
+                timeout=10,
+                verify=False,
+                allow_redirects=False
+            )
+            if response.is_redirect or response.status_code in (301, 302, 303, 307, 308) or "text/html" in response.headers.get("Content-Type", ""):
+                loc = response.headers.get("Location", "")
+                print(f"uamtk POST 可能被重定向/拦截: {response.status_code} -> {loc or response.url}")
+                # fallback: jsonp GET
+                response = self.session.get(
+                    uamtk_url,
+                    params={"appid": "otn", "callback": "callback"},
+                    timeout=10,
+                    verify=False,
+                    allow_redirects=False,
+                    headers={
+                        "Accept": "application/json, text/javascript, */*; q=0.01",
+                        "X-Requested-With": "XMLHttpRequest",
+                        "Referer": "https://kyfw.12306.cn/otn/resources/login.html",
+                        "Origin": "https://kyfw.12306.cn",
+                        "Host": "kyfw.12306.cn",
+                    },
+                )
+                if response.is_redirect or response.status_code in (301, 302, 303, 307, 308):
+                    loc = response.headers.get("Location", "")
+                    print(f"uamtk GET/JSONP 仍被重定向: {response.status_code} -> {loc or response.url}")
             
             if response.status_code == 200:
-                result = response.json()
-                if result.get('result_code') == 0:
-                    newapptk = result.get('newapptk')
+                # 12306 可能返回 JSON / JSONP / HTML（被拦截或重定向到错误页）
+                content_type = response.headers.get("Content-Type", "")
+                raw_text = (response.text or "").strip()
+                
+                def dump_debug():
+                    ts = int(time.time())
+                    fname = f"uamtk_response_{ts}.txt"
+                    try:
+                        with open(fname, "wb") as f:
+                            f.write(response.content or b"")
+                        print(f"uamtk响应已保存: {fname}")
+                    except Exception:
+                        pass
+                
+                result = None
+                try:
+                    if "application/json" in content_type:
+                        result = response.json()
+                    elif raw_text.startswith("{") and raw_text.endswith("}"):
+                        result = json.loads(raw_text)
+                    else:
+                        # JSONP: callback({...})
+                        m = re.search(r"\((\{.*\})\)\s*;?\s*$", raw_text, re.S)
+                        if m:
+                            result = json.loads(m.group(1))
+                except Exception:
+                    result = None
+                
+                if not isinstance(result, dict):
+                    print("uamtk返回不是JSON（可能被风控/重定向/需要额外cookie）")
+                    print(f"uamtk最终URL: {getattr(response, 'url', '')}")
+                    print(f"uamtk Content-Type: {content_type}")
+                    dump_debug()
+                    return False
+                
+                if str(result.get('result_code')) == "0":
+                    newapptk = result.get('newapptk') or result.get("apptk")
+                    if not newapptk:
+                        print("uamtk成功但未返回newapptk/apptk")
+                        dump_debug()
+                        return False
                     return self.uamauth_client(newapptk)
+                
+                print(f"uamtk认证失败: {result.get('result_code')} {result.get('result_message')}")
+                dump_debug()
             return False
         except Exception as e:
             print(f"uamtk认证异常: {str(e)}")
