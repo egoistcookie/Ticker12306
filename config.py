@@ -24,20 +24,20 @@ LOGIN_URL = "https://kyfw.12306.cn/otn/login/userLogin"
 INITIAL_COOKIES = {
     "_jc_save_fromDate": "2026-02-01",
     "_jc_save_fromStation": "%u6DF1%u5733%2CSZQ",
-    "_jc_save_toDate": "2026-01-21",
+    "_jc_save_toDate": "2026-02-01",
     "_jc_save_toStation": "%u957F%u6C99%2CCSQ",
     "_jc_save_wfdc_flag": "dc",
-    "_uab_collina": "176900133709029099648214",
+    "_passport_session": "ec9c435c987742f08560698aa3d89db58407",
+    "_uab_collina": "176900122341592913585214",
     "BIGipServerotn": "1540948234.24610.0000",
     "BIGipServerpassport": "820510986.50215.0000",
     "cursorStatus": "off",
     "guidesStatus": "off",
     "highContrastMode": "defaltMode",
-    "JSESSIONID": "2932FDAC0AABEB3EF85E7ECF72A8F49D",
-    "msToken": "Vt690ExOMvD1SxUwI0UR9nnneBWTKLS0HIT3hyKyQY33qiMKVO6ssa-8uN0TViXOwvz_bSTYOLS_q5tpuuoL0_iTaZz9_EEruhBV4MovQ8dqgNdDrS5nblMERX_52JsBGPQIkpOBcl2HAB42UpqPwX-_-8Q7pYdCIXNBRc6M0lGMqq9Zd9DRDGw=",
+    "JSESSIONID": "209AE9CF69B607EC81327F6FC0A3EAC9",
+    "msToken": "oN5rkJobJ0lHP4xa9to00sFF9ji-sz2wdXFVqHRq1ii0xOEK2B_unYu-R-OR_kxImhZPHA0hFm_ZIcDy7_OykkGytexhm1u-lb6Lgi36p0_NabHhLrh4pTP6DEz7w9ikRMPhwA-z8nyGGKyp3JIUTlHuaTzZj0qpIdA66kM_MP3iWeZucvPNwyQ=",
     "route": "c5c62a339e7744272a54643b3be5bf64",
-    "tk": "vpVoShjNZoE1Y8zbdg0yulFDGefoa-irMzQ2LsctQ48oze1e0",
-    "uKey": "182d4b866be8160df5824520b7ec5f4af5ab0f7ec0454482838b28ed6e6534e9",
+    "tk": "ATv6mtFr8szkdpszbTcOIT3bW4fvj0C2-ngDzLmoqOE51e1e0",
 }
 
 # 查询参数（脚本只负责查询深圳→长沙）

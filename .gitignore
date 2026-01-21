@@ -19,6 +19,8 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+.playwright*
+pw-data/*
 
 # Virtual Environment
 venv/
