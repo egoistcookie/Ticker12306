@@ -2,6 +2,7 @@ import sys
 import os
 import time
 import re
+import json
 import threading
 from datetime import datetime
 from typing import TYPE_CHECKING
@@ -25,7 +26,12 @@ from config import (
     DEFAULT_END_TIME,
     DEFAULT_PASSENGER,
 )
-from cookie_manager import save_cookies, load_cookies, load_cookies_full, check_login_status, wait_qr_login
+from cookie_manager import (
+    save_cookies, load_cookies, load_cookies_full, check_login_status, wait_qr_login,
+    check_requests_cookie_valid, load_cookies_to_requests_session
+)
+from order_flow import OrderFlow
+from network_analyzer import load_network_log, update_get_queue_count_from_network_log
 
 
 def log(msg: str):
@@ -97,7 +103,140 @@ def time_in_range(t: str, start: str, end: str) -> bool:
     return to_minutes(start) <= tm <= to_minutes(end)
 
 
+def run_requests_flow():
+    """
+    使用 requests 方式执行订票流程（如果 Cookie 有效）
+    不触发核对确认，只执行到提交订单阶段
+    """
+    import requests
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    
+    log("[STEP] 尝试使用 requests 方式执行订票流程...")
+    
+    # 创建 requests session
+    session = requests.Session()
+    from config import HEADERS
+    session.headers.update(HEADERS)
+    session.verify = False
+    
+    # 加载 Cookie
+    if not load_cookies_to_requests_session(session):
+        log("[FAIL] 无法加载 Cookie，将使用 Playwright 方式")
+        return False
+    
+    # 检查 Cookie 是否有效
+    if not check_requests_cookie_valid(session):
+        log("[FAIL] Cookie 无效，将使用 Playwright 方式重新登录")
+        return False
+    
+    log("[OK] Cookie 有效，使用 requests 方式执行订票流程")
+    
+    # 尝试加载网络请求日志，如果存在则使用捕获的请求信息
+    network_log = load_network_log()
+    if network_log:
+        log("[INFO] 找到网络请求日志，将使用捕获的请求信息")
+    
+    # 创建 OrderFlow 实例并使用我们的 session
+    flow = OrderFlow()
+    flow.session = session  # 使用已加载 Cookie 的 session
+    
+    # 如果找到网络日志，更新 getQueueCount 方法以使用捕获的请求信息
+    if network_log:
+        update_get_queue_count_from_network_log(flow, network_log)
+    
+    # 查询并选择车次
+    train = flow.query_and_pick(DEFAULT_START_TIME, DEFAULT_END_TIME)
+    if not train:
+        log("[FAIL] 查询车次失败")
+        return False
+    
+    # 提交订单请求
+    if not flow.submit_order(train):
+        log("[FAIL] 提交订单请求失败")
+        return False
+    
+    # 初始化确认页面
+    if not flow.init_dc():
+        log("[FAIL] 初始化确认页面失败")
+        return False
+    
+    # 获取乘车人列表
+    passengers = flow.get_passengers()
+    if not passengers:
+        log("[WARN] 未获取到乘车人列表")
+        return False
+    
+    # 查找默认乘车人
+    default_name = DEFAULT_PASSENGER
+    selected_passenger = None
+    for p in passengers:
+        if p.get("passenger_name") == default_name:
+            selected_passenger = p
+            break
+    
+    if not selected_passenger:
+        log(f"[FAIL] 未找到乘车人: {default_name}")
+        log(f"[INFO] 可选乘车人: {[p.get('passenger_name') for p in passengers]}")
+        return False
+    
+    log(f"[OK] 找到乘车人: {default_name}")
+    flow.selected_passenger = selected_passenger
+    
+    # 构建乘客信息字符串（与 order_flow.py 保持一致）
+    seat_code = "O" if flow.selected_seat_name == "二等座" else "WZ"
+    ticket_type = "1"  # 成人
+    passenger_flag = "N"
+    p = selected_passenger
+    passenger_ticket_str = ",".join([
+        seat_code,
+        "0",
+        ticket_type,
+        p.get("passenger_name", ""),
+        p.get("passenger_id_type_code", ""),
+        p.get("passenger_id_no", ""),
+        p.get("mobile_no", ""),
+        passenger_flag
+    ])
+    # oldPassengerStr: name,id_type,id_no,passenger_type_
+    old_passenger_str = ",".join([
+        p.get("passenger_name", ""),
+        p.get("passenger_id_type_code", ""),
+        p.get("passenger_id_no", ""),
+        p.get("passenger_type", "1")
+    ]) + "_"
+    
+    # 校验订单信息
+    if not flow.check_order_info(passenger_ticket_str, old_passenger_str):
+        log("[FAIL] 校验订单信息失败")
+        return False
+    
+    # 在获取排队信息前，添加延迟，模拟真实浏览器操作
+    log("[INFO] 等待 2 秒后获取排队信息（模拟浏览器操作）...")
+    time.sleep(2)
+    
+    # 获取排队信息
+    if not flow.get_queue_count():
+        log("[FAIL] 获取排队信息失败")
+        return False
+    
+    # 不调用 confirm_single_for_queue，停止在这里
+    log("[OK] 已执行到提交订单阶段，未触发核对确认（不会生成待支付订单）")
+    log(f"[INFO] 选择的席别: {flow.selected_seat_name}")
+    log("[INFO] 如需生成待支付订单，请在手机端或网页端手动确认")
+    
+    return True
+
+
 def main():
+    # 优先尝试使用 requests 方式（如果 Cookie 有效）
+    log("[STEP] 检查是否可以使用 requests 方式...")
+    if run_requests_flow():
+        log("[OK] requests 流程执行成功，退出")
+        return
+    
+    log("[INFO] requests 流程不可用，将使用 Playwright 方式")
+    
     # 直接带参数打开列表页（常用格式 fs/ts/date）
     left_ticket_url = (
         "https://kyfw.12306.cn/otn/leftTicket/init"
@@ -124,6 +263,83 @@ def main():
         browser = p.chromium.launch(**launch_options)
         context = browser.new_context(locale="zh-CN")
         page = context.new_page()
+        
+        # 添加网络请求监控，记录所有 API 请求
+        captured_requests = []
+        
+        def handle_request(request):
+            """监控所有请求"""
+            url = request.url
+            # 只记录 12306 相关的 API 请求
+            if "kyfw.12306.cn" in url and "/otn/" in url:
+                method = request.method
+                headers = request.headers
+                post_data = request.post_data
+                
+                req_info = {
+                    "url": url,
+                    "method": method,
+                    "headers": dict(headers),
+                    "post_data": post_data,
+                    "timestamp": time.time(),
+                }
+                captured_requests.append(req_info)
+                if "getQueueCount" in url or "checkOrderInfo" in url or "getPassengerDTOs" in url:
+                    log(f"[NETWORK] {method} {url}")
+                    if post_data:
+                        log(f"[NETWORK] POST Data: {post_data[:300]}")
+        
+        def handle_response(response):
+            """监控所有响应"""
+            url = response.url
+            if "kyfw.12306.cn" in url and "/otn/" in url:
+                status = response.status
+                headers = response.headers
+                content_type = headers.get("content-type", "")
+                
+                # 只记录关键 API 的响应
+                if "getQueueCount" in url or "checkOrderInfo" in url or "getPassengerDTOs" in url:
+                    try:
+                        if "application/json" in content_type:
+                            body = response.json()
+                            log(f"[NETWORK] Response {status}: {str(body)[:300]}")
+                        else:
+                            body = response.text()
+                            log(f"[NETWORK] Response {status}: {body[:300]}")
+                    except:
+                        log(f"[NETWORK] Response {status}: (无法解析)")
+                
+                # 更新对应的请求信息
+                for req in captured_requests:
+                    if req["url"] == url and req.get("response") is None:
+                        try:
+                            if "application/json" in content_type:
+                                body = response.json()
+                                req["response"] = {
+                                    "status": status,
+                                    "headers": dict(headers),
+                                    "content_type": content_type,
+                                    "body": body,
+                                }
+                            else:
+                                body = response.text()
+                                req["response"] = {
+                                    "status": status,
+                                    "headers": dict(headers),
+                                    "content_type": content_type,
+                                    "body": body[:1000],
+                                }
+                        except Exception as e:
+                            req["response"] = {
+                                "status": status,
+                                "headers": dict(headers),
+                                "content_type": content_type,
+                                "error": str(e),
+                            }
+                        break
+        
+        page.on("request", handle_request)
+        page.on("response", handle_response)
         
         # 1. 尝试加载保存的 Cookie
         saved_cookies_full = load_cookies_full()
@@ -740,8 +956,7 @@ def main():
         current_url = page.url
         log(f"[INFO] 提交后当前URL: {current_url}")
         
-        # 检查是否进入核对页面（通常URL包含 confirmPassenger/confirmSingleForQueue 或类似）
-        # 或者页面中有"核对"、"确认"等文本
+        # 检查是否进入核对页面（不点击确认按钮，防止生成待支付订单）
         is_confirm_page = False
         confirm_page_indicators = [
             "confirmPassenger/confirmSingleForQueue",
@@ -753,53 +968,8 @@ def main():
         for indicator in confirm_page_indicators:
             if indicator in current_url or page.locator(f"text={indicator}").count() > 0:
                 is_confirm_page = True
-                log(f"[INFO] 检测到核对页面（指示器: {indicator}）")
+                log(f"[INFO] 检测到核对页面（指示器: {indicator}），已停止流程，不点击确认按钮")
                 break
-        
-        # 如果在核对页面，需要点击确认按钮
-        if is_confirm_page:
-            log("[STEP] 在核对页面，点击确认按钮...")
-            confirm_clicked = False
-            
-            # 优先使用已知有效的选择器
-            confirm_selectors = [
-                "#qr_submit_id",  # 已知有效的选择器
-                "a:has-text('提交订单')",
-                "a:has-text('确认')",
-                "button:has-text('确认')",
-                "#confirm_id",
-                "a.btn72",
-            ]
-            
-            for selector in confirm_selectors:
-                try:
-                    confirm_btn = page.locator(selector).first
-                    if confirm_btn.count() > 0:
-                        try:
-                            confirm_btn.scroll_into_view_if_needed()
-                            time.sleep(0.5)
-                        except:
-                            pass
-                        
-                        # 尝试点击（如果不可见则强制点击）
-                        try:
-                            if confirm_btn.is_visible(timeout=2000):
-                                confirm_btn.click(timeout=5000)
-                            else:
-                                confirm_btn.click(force=True, timeout=5000)
-                            log(f"[OK] 已点击确认按钮（选择器: {selector}）")
-                            confirm_clicked = True
-                            break
-                        except:
-                            continue
-                except:
-                    continue
-            
-            if confirm_clicked:
-                # 等待确认后的结果
-                time.sleep(5)
-                page.wait_for_load_state("domcontentloaded", timeout=10000)
-                time.sleep(2)
         
         # 检查最终结果
         final_url = page.url
@@ -830,6 +1000,28 @@ def main():
             log("[OK] 已成功生成待支付订单，请在手机端检查待支付订单（可付款或取消）")
         else:
             log("[WARN] 未明确检测到订单成功生成，请在手机端检查待支付订单（可付款或取消）")
+        
+        # 保存捕获的网络请求信息
+        if captured_requests:
+            network_log_file = f"network_requests_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            try:
+                with open(network_log_file, "w", encoding="utf-8") as f:
+                    json.dump(captured_requests, f, indent=2, ensure_ascii=False)
+                log(f"[INFO] 已保存网络请求日志: {network_log_file}")
+                
+                # 特别提取 getQueueCount 请求信息
+                for req in captured_requests:
+                    if "getQueueCount" in req["url"]:
+                        log(f"[INFO] getQueueCount 请求详情:")
+                        log(f"  URL: {req['url']}")
+                        log(f"  Method: {req['method']}")
+                        log(f"  Headers: {json.dumps(req['headers'], indent=2, ensure_ascii=False)}")
+                        log(f"  POST Data: {req.get('post_data', '')}")
+                        if req.get("response"):
+                            log(f"  Response Status: {req['response'].get('status')}")
+                            log(f"  Response Body: {json.dumps(req['response'].get('body'), indent=2, ensure_ascii=False)[:500]}")
+            except Exception as e:
+                log(f"[WARN] 保存网络请求日志失败: {str(e)}")
         
         browser.close()
 

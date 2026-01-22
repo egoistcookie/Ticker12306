@@ -110,7 +110,13 @@ class OrderFlow:
     def init_dc(self):
         self.log("[STEP] 进入确认订单页 initDc")
         url = f"{BASE_URL}/otn/confirmPassenger/initDc"
-        resp = self.session.post(url, data={"_json_att": ""}, timeout=10, verify=False)
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Origin": "https://kyfw.12306.cn",
+            "Referer": "https://kyfw.12306.cn/otn/leftTicket/init",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        resp = self.session.post(url, data={"_json_att": ""}, headers=headers, timeout=10, verify=False)
         if resp.status_code != 200:
             self.log(f"[FAIL] initDc 状态码 {resp.status_code}")
             return False
@@ -224,9 +230,16 @@ class OrderFlow:
     def get_passengers(self):
         self.log("[STEP] 获取乘车人列表")
         url = f"{BASE_URL}/otn/confirmPassenger/getPassengerDTOs"
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Origin": "https://kyfw.12306.cn",
+            "Referer": "https://kyfw.12306.cn/otn/confirmPassenger/initDc",
+            "X-Requested-With": "XMLHttpRequest",
+        }
         resp = self.session.post(
             url,
             data={"_json_att": "", "REPEAT_SUBMIT_TOKEN": self.repeat_token},
+            headers=headers,
             timeout=10,
             verify=False,
         )
@@ -254,7 +267,14 @@ class OrderFlow:
             "_json_att": "",
             "REPEAT_SUBMIT_TOKEN": self.repeat_token,
         }
-        resp = self.session.post(url, data=data, timeout=10, verify=False)
+        # 使用完整的浏览器 headers
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Origin": "https://kyfw.12306.cn",
+            "Referer": "https://kyfw.12306.cn/otn/confirmPassenger/initDc",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        resp = self.session.post(url, data=data, headers=headers, timeout=10, verify=False)
         try:
             res = resp.json()
         except Exception:
@@ -285,7 +305,25 @@ class OrderFlow:
             "_json_att": "",
             "REPEAT_SUBMIT_TOKEN": self.repeat_token,
         }
-        resp = self.session.post(url, data=data, timeout=10, verify=False)
+        
+        # 完全模拟浏览器请求：设置完整的 headers
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Origin": "https://kyfw.12306.cn",
+            "Referer": "https://kyfw.12306.cn/otn/confirmPassenger/initDc",
+            "X-Requested-With": "XMLHttpRequest",
+            "Connection": "keep-alive",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        }
+        
+        # 使用独立的请求，确保 headers 正确
+        resp = self.session.post(url, data=data, headers=headers, timeout=10, verify=False)
         try:
             res = resp.json()
         except Exception:

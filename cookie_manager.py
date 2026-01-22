@@ -7,6 +7,7 @@ import os
 import time
 from typing import Dict, List, Optional
 from playwright.sync_api import Page, TimeoutError as PWTimeout
+import requests
 
 
 COOKIE_FILE = "cookies.json"
@@ -525,3 +526,60 @@ def wait_qr_login(page: Page, timeout: int = 300) -> bool:
     except Exception as e:
         print(f"[FAIL] 最后检查登录状态异常: {str(e)}")
         return False
+
+
+def check_requests_cookie_valid(session: requests.Session) -> bool:
+    """
+    检查 requests session 的 Cookie 是否有效
+    通过调用 checkUser API 验证登录状态
+    返回 True 表示 Cookie 有效，False 表示需要重新登录
+    """
+    try:
+        url = "https://kyfw.12306.cn/otn/login/checkUser"
+        headers = {
+            "Referer": "https://kyfw.12306.cn/otn/index/initMy12306",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        resp = session.get(url, headers=headers, timeout=10, verify=False)
+        if resp.status_code != 200:
+            print(f"[DEBUG] checkUser API 返回状态码: {resp.status_code}")
+            return False
+        
+        try:
+            data = resp.json()
+            # 检查返回的数据，确认是否已登录
+            if data.get("data", {}).get("flag") == True or (data.get("status") == True and data.get("data", {}).get("loginCheck") == "Y"):
+                print("[DEBUG] requests Cookie 验证通过，已登录")
+                return True
+            else:
+                print(f"[DEBUG] requests Cookie 验证失败: {data}")
+                return False
+        except Exception as e:
+            print(f"[DEBUG] requests Cookie 验证响应解析失败: {str(e)}")
+            return False
+    except Exception as e:
+        print(f"[WARN] requests Cookie 验证异常: {str(e)}")
+        return False
+
+
+def load_cookies_to_requests_session(session: requests.Session) -> bool:
+    """
+    从文件加载 Cookie 并设置到 requests session
+    返回 True 表示加载成功，False 表示加载失败
+    """
+    cookie_dict = load_cookies()
+    if not cookie_dict:
+        print("[WARN] 未找到保存的 Cookie 文件")
+        return False
+    
+    # 将 Cookie 设置到 session
+    # requests 的 cookies.set 会自动处理 domain，我们只需要设置 name 和 value
+    for name, value in cookie_dict.items():
+        # 对于 requests，直接设置到 session.cookies 即可，它会自动处理 domain
+        session.cookies.set(name, str(value), domain="kyfw.12306.cn")
+        # 对于 .12306.cn 的 Cookie，也设置一次（某些 Cookie 可能在 .12306.cn 下）
+        if name in {"cursorStatus", "guidesStatus", "highContrastMode", "_uab_collina"}:
+            session.cookies.set(name, str(value), domain=".12306.cn")
+    
+    print(f"[OK] 已加载 {len(cookie_dict)} 个 Cookie 到 requests session")
+    return True
