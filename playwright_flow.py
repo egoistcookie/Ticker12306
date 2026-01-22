@@ -256,12 +256,79 @@ def main():
             browser_exe = chromium_1187_path
             log(f"[INFO] 使用 chromium-1187: {browser_exe}")
         
-        launch_options = {"headless": False}
+        # 配置浏览器启动参数，添加反检测措施
+        launch_options = {
+            "headless": False,
+            "args": [
+                "--disable-blink-features=AutomationControlled",  # 隐藏自动化特征
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-web-security",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-site-isolation-trials",
+                "--disable-infobars",  # 隐藏"Chrome正在受到自动测试软件的控制"提示
+                "--window-size=1920,1080",
+            ]
+        }
         if browser_exe:
             launch_options["executable_path"] = browser_exe
         
         browser = p.chromium.launch(**launch_options)
-        context = browser.new_context(locale="zh-CN")
+        
+        # 配置浏览器上下文，模拟真实浏览器环境
+        context = browser.new_context(
+            locale="zh-CN",
+            timezone_id="Asia/Shanghai",
+            viewport={"width": 1920, "height": 1080},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            # 添加额外的 HTTP headers
+            extra_http_headers={
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
+                "Cache-Control": "max-age=0",
+            },
+            # 设置地理位置（可选）
+            geolocation={"longitude": 116.3974, "latitude": 39.9093},  # 北京
+            permissions=["geolocation"],
+        )
+        
+        # 注入脚本隐藏 webdriver 特征
+        context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            });
+            
+            // 覆盖 plugins
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5]
+            });
+            
+            // 覆盖 languages
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['zh-CN', 'zh', 'en']
+            });
+            
+            // 覆盖 permissions
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) => (
+                parameters.name === 'notifications' ?
+                    Promise.resolve({ state: Notification.permission }) :
+                    originalQuery(parameters)
+            );
+            
+            // Chrome 特征
+            window.chrome = {
+                runtime: {}
+            };
+        """)
         page = context.new_page()
         
         # 添加网络请求监控，记录所有 API 请求
@@ -409,10 +476,41 @@ def main():
         
         # 4. 继续原有流程
         log(f"[STEP] 打开余票列表页: {left_ticket_url}")
-        page.goto(left_ticket_url, wait_until="domcontentloaded", timeout=60000)
+        try:
+            # 使用 networkidle 等待网络请求完成，模拟真实浏览器行为
+            page.goto(left_ticket_url, wait_until="networkidle", timeout=60000)
+        except PWTimeout:
+            # 如果 networkidle 超时，使用 domcontentloaded 作为备选
+            log("[WARN] networkidle 超时，使用 domcontentloaded")
+            page.goto(left_ticket_url, wait_until="domcontentloaded", timeout=60000)
         
-        # 等待页面完全加载
-        time.sleep(2)
+        # 等待页面完全加载（模拟人类阅读时间）
+        time.sleep(3)
+        
+        # 检查页面是否有错误提示
+        try:
+            error_selectors = [
+                "text=网络可能存在问题",
+                "text=请您重试一下",
+                "text=系统繁忙",
+                "text=请稍后重试",
+                ".error-msg",
+                "#errorMsg",
+            ]
+            for selector in error_selectors:
+                error_elem = page.locator(selector).first
+                if error_elem.count() > 0:
+                    error_text = error_elem.inner_text(timeout=2000)
+                    if error_text:
+                        log(f"[WARN] 页面检测到错误提示: {error_text}")
+                        # 等待一下，然后重试
+                        time.sleep(5)
+                        log("[INFO] 等待后重新加载页面...")
+                        page.reload(wait_until="networkidle", timeout=60000)
+                        time.sleep(3)
+                        break
+        except:
+            pass
         
         # 检查是否跳转到登录页（说明 Cookie 无效）
         current_url = page.url
@@ -440,6 +538,8 @@ def main():
                 try:
                     query_button = page.locator(selector).first
                     if query_button.is_visible(timeout=3000):
+                        # 添加延迟，模拟人类点击行为
+                        time.sleep(1)
                         query_button.click()
                         log(f"[OK] 已点击查询按钮（选择器: {selector}）")
                         break
@@ -457,8 +557,14 @@ def main():
             # 等待查询结果表格出现
             page.wait_for_selector("#queryLeftTable", timeout=30000)
             
-            # 额外等待一下，确保数据完全加载
-            time.sleep(2)
+            # 等待网络请求完成
+            try:
+                page.wait_for_load_state("networkidle", timeout=10000)
+            except:
+                pass
+            
+            # 额外等待一下，确保数据完全加载（模拟人类阅读时间）
+            time.sleep(3)
             
             # 检查是否有车次数据
             rows = page.locator("tr[id^='ticket_']")
