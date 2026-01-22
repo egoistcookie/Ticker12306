@@ -1,8 +1,18 @@
 import sys
+import os
 import time
 import re
+import threading
 from datetime import datetime
+from typing import TYPE_CHECKING
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+# 设置 Playwright 浏览器安装路径（项目目录下）
+browser_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pw-browsers")
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = browser_path
+
+if TYPE_CHECKING:
+    from playwright.sync_api import Page
 
 from config import (
     INITIAL_COOKIES,
@@ -15,6 +25,7 @@ from config import (
     DEFAULT_END_TIME,
     DEFAULT_PASSENGER,
 )
+from cookie_manager import save_cookies, load_cookies, load_cookies_full, check_login_status, wait_qr_login
 
 
 def log(msg: str):
@@ -25,10 +36,10 @@ def log(msg: str):
         sys.stdout.buffer.flush()
 
 
-def pw_cookies_from_config():
-    # Playwright cookies 需要 domain/path
+def pw_cookies_from_dict(cookie_dict: dict):
+    """将字典格式的 Cookie 转换为 Playwright 格式"""
     cookies = []
-    for k, v in INITIAL_COOKIES.items():
+    for k, v in cookie_dict.items():
         cookies.append(
             {
                 "name": k,
@@ -38,7 +49,7 @@ def pw_cookies_from_config():
             }
         )
         # 一些 cookie 实际在 .12306.cn 下
-        if k in {"cursorStatus", "guidesStatus"}:
+        if k in {"cursorStatus", "guidesStatus", "highContrastMode"}:
             cookies.append(
                 {
                     "name": k,
@@ -48,6 +59,27 @@ def pw_cookies_from_config():
                 }
             )
     return cookies
+
+
+def keep_session_alive(page, interval: int = 1200):
+    """
+    会话保持：每 interval 秒访问一次页面，避免掉线
+    interval=1200 表示 20 分钟（比 30 分钟短，确保不会掉线）
+    """
+    def _keep_alive():
+        while True:
+            time.sleep(interval)
+            try:
+                # 访问一个轻量级页面保持会话
+                page.goto("https://kyfw.12306.cn/otn/index/initMy12306", 
+                         wait_until="domcontentloaded", timeout=10000)
+                log(f"[KEEP-ALIVE] 会话保持：{datetime.now().strftime('%H:%M:%S')}")
+            except Exception as e:
+                log(f"[WARN] 会话保持失败: {str(e)}")
+    
+    thread = threading.Thread(target=_keep_alive, daemon=True)
+    thread.start()
+    log(f"[INFO] 已启动会话保持线程（每 {interval//60} 分钟刷新一次）")
 
 
 def time_in_range(t: str, start: str, end: str) -> bool:
@@ -73,16 +105,106 @@ def main():
     )
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
+        # 尝试使用已安装的浏览器（优先使用 chromium-1200，如果没有则使用 chromium-1187）
+        browser_exe = None
+        chromium_1200_path = os.path.join(browser_path, "chromium-1200", "chrome-win", "chrome.exe")
+        chromium_1187_path = os.path.join(browser_path, "chromium-1187", "chrome-win", "chrome.exe")
+        
+        if os.path.exists(chromium_1200_path):
+            browser_exe = chromium_1200_path
+            log(f"[INFO] 使用 chromium-1200: {browser_exe}")
+        elif os.path.exists(chromium_1187_path):
+            browser_exe = chromium_1187_path
+            log(f"[INFO] 使用 chromium-1187: {browser_exe}")
+        
+        launch_options = {"headless": False}
+        if browser_exe:
+            launch_options["executable_path"] = browser_exe
+        
+        browser = p.chromium.launch(**launch_options)
         context = browser.new_context(locale="zh-CN")
-        context.add_cookies(pw_cookies_from_config())
         page = context.new_page()
-
+        
+        # 1. 尝试加载保存的 Cookie
+        saved_cookies_full = load_cookies_full()
+        if saved_cookies_full:
+            log(f"[INFO] 从文件加载了 {len(saved_cookies_full)} 个 Cookie（完整格式）")
+            context.add_cookies(saved_cookies_full)
+        else:
+            # 如果没有保存的 Cookie，使用 config.py 中的
+            log("[INFO] 使用 config.py 中的 Cookie")
+            context.add_cookies(pw_cookies_from_dict(INITIAL_COOKIES))
+        
+        # 2. 检测登录状态
+        log("[STEP] 检测登录状态...")
+        max_login_retries = 3
+        login_success = False
+        
+        for retry in range(max_login_retries):
+            if check_login_status(page):
+                log("[OK] 登录状态有效")
+                login_success = True
+                break
+            
+            if retry > 0:
+                log(f"[WARN] 登录验证失败，重试 {retry}/{max_login_retries-1}")
+            
+            log("[WARN] Cookie 已失效，需要重新登录")
+            # 扫码登录
+            if wait_qr_login(page, timeout=300):
+                # wait_qr_login 已经验证了登录状态，这里只需要保存 Cookie
+                log("[INFO] 登录成功，保存 Cookie...")
+                time.sleep(2)  # 等待 Cookie 完全设置
+                
+                # 保存所有 Cookie
+                saved = save_cookies(page)
+                if saved:
+                    log(f"[OK] Cookie 已保存（共 {len(saved)} 个）")
+                    # 更新 context 的 cookies（使用完整格式）
+                    context.clear_cookies()
+                    saved_full = load_cookies_full()
+                    if saved_full:
+                        context.add_cookies(saved_full)
+                        log("[OK] Cookie 已更新到浏览器上下文（使用完整格式）")
+                    else:
+                        # 如果加载失败，使用简单格式
+                        context.add_cookies(pw_cookies_from_dict(saved))
+                        log("[OK] Cookie 已更新到浏览器上下文（使用简单格式）")
+                    
+                    # wait_qr_login 已经验证了登录状态，这里直接认为登录成功
+                    log("[OK] 登录状态已验证（wait_qr_login 已确认）")
+                    login_success = True
+                    break
+                else:
+                    log("[WARN] Cookie 保存失败，但登录可能已成功，继续尝试...")
+                    # 即使保存失败，也尝试继续（可能只是保存问题）
+                    login_success = True
+                    break
+            else:
+                log("[FAIL] 扫码登录失败或超时")
+        
+        if not login_success:
+            log("[FAIL] 登录失败，已达到最大重试次数，退出")
+            browser.close()
+            return
+        
+        # 3. 启动会话保持线程（每 20 分钟刷新一次，避免 30 分钟掉线）
+        keep_session_alive(page, interval=1200)
+        
+        # 4. 继续原有流程
         log(f"[STEP] 打开余票列表页: {left_ticket_url}")
         page.goto(left_ticket_url, wait_until="domcontentloaded", timeout=60000)
         
         # 等待页面完全加载
         time.sleep(2)
+        
+        # 检查是否跳转到登录页（说明 Cookie 无效）
+        current_url = page.url
+        if "login" in current_url.lower() or "userLogin" in current_url or "resources/login" in current_url:
+            log(f"[FAIL] 打开余票列表页后跳转到登录页: {current_url}")
+            log("[FAIL] Cookie 无效，需要重新登录")
+            browser.close()
+            return
         
         # 点击查询按钮（如果存在）
         log("[STEP] 点击查询按钮")
@@ -339,24 +461,173 @@ def main():
 
         log(f"[PICK] 车次 {pick_train_code} 出发 {pick_depart_time} 座位: {pick_seat_info}")
 
-        # 点击“预订”按钮（按钮文本可能是 预订/候补/抢票，这里只点“预订”）
-        try:
-            pick_row.get_by_role("link", name="预订").click(timeout=5000)
-        except PWTimeout:
-            # 有时按钮是 <a class='btn72'>预订</a>
+        # 点击"预订"按钮（按钮文本可能是 预订/候补/抢票，这里只点"预订"）
+        log(f"[STEP] 点击车次 {pick_train_code} 的预订按钮...")
+        booking_clicked = False
+        
+        # 尝试多种方式点击预订按钮
+        booking_selectors = [
+            ("role", "link", "预订"),
+            ("selector", "a:has-text('预订')"),
+            ("selector", "a.btn72:has-text('预订')"),
+            ("selector", ".btn72"),
+            ("selector", "a[title='预订']"),
+        ]
+        
+        for item in booking_selectors:
             try:
-                pick_row.locator("a:has-text('预订')").click(timeout=5000)
-            except PWTimeout:
-                log("[FAIL] 未找到可点击的“预订”按钮（可能无票或页面结构变化）")
-                browser.close()
-                return
+                method = item[0]
+                selector = item[1]
+                if method == "role":
+                    name = item[2]
+                    btn = pick_row.get_by_role(selector, name=name)
+                else:
+                    btn = pick_row.locator(selector).first
+                
+                if btn.is_visible(timeout=2000):
+                    log(f"[INFO] 找到预订按钮（方法: {method}, 选择器: {selector}）")
+                    # 滚动到按钮位置，确保可见
+                    btn.scroll_into_view_if_needed()
+                    time.sleep(0.5)
+                    btn.click(timeout=5000)
+                    log("[OK] 已点击预订按钮")
+                    booking_clicked = True
+                    break
+            except Exception as e:
+                log(f"[DEBUG] 尝试点击预订按钮失败（方法: {method}）: {str(e)[:50]}")
+                continue
+        
+        if not booking_clicked:
+            log("[FAIL] 未找到可点击的\"预订\"按钮（可能无票或页面结构变化）")
+            # 保存截图以便调试
+            try:
+                page.screenshot(path="booking_button_not_found.png", full_page=True)
+                log("[INFO] 已保存截图: booking_button_not_found.png")
+            except:
+                pass
+            browser.close()
+            return
 
         log("[STEP] 等待进入确认订单页")
         try:
-            page.wait_for_url("**/otn/confirmPassenger/initDc**", timeout=60000)
-            log(f"[OK] 已进入确认订单页: {page.url}")
-        except PWTimeout:
-            log(f"[WARN] 未跳转到 initDc，当前URL: {page.url}")
+            # 等待一小段时间，让页面响应点击
+            time.sleep(1)
+            
+            # 检查是否有弹窗或提示（比如"系统繁忙"、"请先登录"等）
+            try:
+                # 等待可能的弹窗出现（最多等待 2 秒）
+                page.wait_for_timeout(2000)
+                
+                # 检查常见的提示文本
+                alert_selectors = [
+                    "text=系统繁忙",
+                    "text=请先登录",
+                    "text=登录已失效",
+                    "text=该车次已售完",
+                    "text=无票",
+                    ".modal",
+                    ".dialog",
+                    ".alert",
+                    "#alert",
+                    ".message",
+                ]
+                
+                for selector in alert_selectors:
+                    try:
+                        alert_element = page.locator(selector).first
+                        if alert_element.is_visible(timeout=1000):
+                            alert_text = alert_element.inner_text(timeout=1000)
+                            log(f"[WARN] 检测到提示信息: {alert_text[:100]}")
+                            # 尝试关闭弹窗（如果有关闭按钮）
+                            try:
+                                close_btn = page.locator("button:has-text('确定'), button:has-text('关闭'), .close, .modal-close").first
+                                if close_btn.is_visible(timeout=1000):
+                                    close_btn.click()
+                                    time.sleep(1)
+                            except:
+                                pass
+                            break
+                    except:
+                        continue
+            except:
+                pass
+            
+            # 等待页面跳转（可能是确认订单页，也可能是登录页）
+            page.wait_for_load_state("domcontentloaded", timeout=10000)
+            time.sleep(2)
+            
+            current_url = page.url
+            log(f"[INFO] 点击预订后的 URL: {current_url}")
+            
+            # 检查是否跳转到登录页
+            if "login" in current_url.lower() or "userLogin" in current_url or "resources/login" in current_url or "/otn/passport" in current_url:
+                log("[FAIL] 已跳转到登录页，说明 Cookie 无效，需要重新登录")
+                # 保存截图以便调试
+                try:
+                    page.screenshot(path="redirected_to_login.png", full_page=True)
+                    log("[INFO] 已保存截图: redirected_to_login.png")
+                except:
+                    pass
+                browser.close()
+                return
+            
+            # 检查是否进入确认订单页
+            if "confirmPassenger/initDc" in current_url:
+                log(f"[OK] 已进入确认订单页: {current_url}")
+            else:
+                log(f"[WARN] 未跳转到 initDc，当前URL: {current_url}")
+                
+                # 检查页面是否有错误信息
+                try:
+                    error_texts = page.locator("text=系统繁忙, text=请先登录, text=登录已失效, text=该车次已售完").all()
+                    if error_texts:
+                        for error_elem in error_texts:
+                            try:
+                                error_msg = error_elem.inner_text(timeout=1000)
+                                log(f"[WARN] 页面错误信息: {error_msg}")
+                            except:
+                                pass
+                except:
+                    pass
+                
+                # 尝试等待一下，可能还在加载（增加等待时间）
+                try:
+                    # 等待 URL 变化或等待 initDc 页面
+                    page.wait_for_url("**/otn/confirmPassenger/initDc**", timeout=15000)
+                    log(f"[OK] 已进入确认订单页: {page.url}")
+                except PWTimeout:
+                    # 再次检查当前 URL
+                    final_url = page.url
+                    log(f"[FAIL] 等待超时，仍未进入确认订单页，当前URL: {final_url}")
+                    
+                    # 保存截图以便调试
+                    try:
+                        page.screenshot(path="booking_failed.png", full_page=True)
+                        log("[INFO] 已保存截图: booking_failed.png")
+                    except:
+                        pass
+                    
+                    # 检查是否还在查询页面，可能是点击失败
+                    if "leftTicket/init" in final_url:
+                        log("[WARN] 仍在查询页面，可能点击预订按钮失败或需要处理弹窗")
+                        # 尝试再次点击预订按钮
+                        try:
+                            log("[INFO] 尝试再次点击预订按钮...")
+                            pick_row.get_by_role("link", name="预订").click(timeout=5000)
+                            time.sleep(3)
+                            page.wait_for_url("**/otn/confirmPassenger/initDc**", timeout=15000)
+                            log(f"[OK] 重新点击后已进入确认订单页: {page.url}")
+                        except:
+                            log("[FAIL] 重新点击也失败")
+                            browser.close()
+                            return
+                    else:
+                        browser.close()
+                        return
+        except Exception as e:
+            log(f"[FAIL] 等待进入确认订单页异常: {str(e)}")
+            browser.close()
+            return
         
         # 等待页面完全加载
         time.sleep(2)
@@ -366,250 +637,200 @@ def main():
         passenger_selected = False
         
         try:
-            # 等待乘车人列表加载（使用更宽松的条件）
-            log("[INFO] 等待乘车人列表加载...")
-            try:
-                # 先等待页面基本元素加载
-                page.wait_for_load_state("domcontentloaded", timeout=10000)
-                time.sleep(2)  # 额外等待确保页面完全加载
-                
-                # 尝试查找checkbox，但不要求立即可见
-                all_checkboxes = page.locator("input[type='checkbox'], input[type='radio']")
-                checkbox_count = all_checkboxes.count()
-                if checkbox_count == 0:
-                    log("[WARN] 未找到checkbox，等待更长时间...")
-                    time.sleep(3)
-                    checkbox_count = all_checkboxes.count()
-                
-                if checkbox_count == 0:
-                    log("[WARN] 仍然未找到checkbox，尝试等待页面完全加载...")
-                    page.wait_for_load_state("networkidle", timeout=10000)
-                    time.sleep(2)
-            except Exception as e:
-                log(f"[WARN] 等待页面加载时出错: {str(e)}，继续尝试查找元素...")
-                time.sleep(2)
+            # 等待页面加载
+            page.wait_for_load_state("domcontentloaded", timeout=10000)
+            time.sleep(2)
             
-            # 方法1: 直接查找所有checkbox，通过附近的文本匹配
-            log("[INFO] 方法1: 遍历所有checkbox查找乘车人...")
+            # 查找所有checkbox，通过容器文本匹配乘车人
             all_checkboxes = page.locator("input[type='checkbox']")
             checkbox_count = all_checkboxes.count()
-            log(f"[DEBUG] 找到 {checkbox_count} 个checkbox")
             
             if checkbox_count == 0:
-                log("[WARN] 未找到任何checkbox，页面可能未完全加载")
-                page.screenshot(path="no_checkbox_found.png", full_page=True)
-                log("[INFO] 已保存截图: no_checkbox_found.png")
-            else:
-                for idx in range(checkbox_count):
-                    try:
-                        cb = all_checkboxes.nth(idx)
-                        # 获取checkbox所在的行或容器
-                        container = cb.locator("xpath=ancestor::tr | ancestor::li | ancestor::div | ancestor::label | ancestor::td").first
-                        if container.count() > 0:
+                log("[WARN] 未找到checkbox，等待页面加载...")
+                time.sleep(3)
+                checkbox_count = all_checkboxes.count()
+            
+            for idx in range(checkbox_count):
+                try:
+                    cb = all_checkboxes.nth(idx)
+                    # 获取checkbox所在的容器
+                    container = cb.locator("xpath=ancestor::tr | ancestor::li | ancestor::div | ancestor::label | ancestor::td").first
+                    if container.count() > 0:
+                        try:
+                            container_text = container.inner_text(timeout=1000)
+                        except:
                             try:
-                                container_text = container.inner_text(timeout=1000)
+                                container_text = container.inner_html(timeout=1000)
                             except:
-                                # 如果获取文本失败，尝试获取HTML
+                                container_text = ""
+                        
+                        # 检查是否包含乘车人姓名
+                        if DEFAULT_PASSENGER in container_text:
+                            log(f"[FOUND] 找到乘车人 '{DEFAULT_PASSENGER}' 的checkbox")
+                            # 检查是否已勾选
+                            if not cb.is_checked():
+                                # 使用force强制操作（即使不可见）
                                 try:
-                                    container_text = container.inner_html(timeout=1000)
+                                    cb.check(force=True, timeout=2000)
                                 except:
-                                    container_text = ""
+                                    cb.click(force=True, timeout=2000)
+                                time.sleep(0.8)
                             
-                            # 检查是否包含乘车人姓名
-                            if DEFAULT_PASSENGER in container_text:
-                                log(f"[FOUND] 找到乘车人 '{DEFAULT_PASSENGER}' 的checkbox（第{idx+1}个）")
-                                try:
-                                    # 检查是否已勾选（不要求可见）
-                                    is_checked = cb.is_checked()
-                                    if not is_checked:
-                                        log(f"[INFO] checkbox未勾选，正在勾选...")
-                                        # 使用force选项，即使不可见也强制操作
-                                        try:
-                                            cb.check(force=True, timeout=2000)
-                                        except:
-                                            # 如果check失败，尝试点击
-                                            try:
-                                                cb.click(force=True, timeout=2000)
-                                            except Exception as click_err:
-                                                log(f"[WARN] 点击checkbox失败: {str(click_err)}")
-                                                continue
-                                        
-                                        time.sleep(0.8)  # 等待勾选生效
-                                        # 再次检查是否勾选成功
-                                        if cb.is_checked():
-                                            passenger_selected = True
-                                            log(f"[OK] 已成功勾选乘车人 '{DEFAULT_PASSENGER}'")
-                                            break
-                                        else:
-                                            log(f"[WARN] 勾选后验证失败，checkbox可能仍未被勾选")
-                                    else:
-                                        log(f"[OK] 乘车人 '{DEFAULT_PASSENGER}' 的checkbox已经勾选")
-                                        passenger_selected = True
-                                        break
-                                except Exception as e:
-                                    log(f"[WARN] 操作checkbox时出错: {str(e)}")
-                                    continue
-                    except Exception as e:
-                        log(f"[WARN] 检查第{idx+1}个checkbox时出错: {str(e)}")
-                        continue
-            
-            # 方法2: 如果方法1失败，尝试通过文本定位后查找checkbox
-            if not passenger_selected:
-                log("[INFO] 方法2: 通过文本定位后查找checkbox...")
-                try:
-                    # 查找包含乘车人姓名的元素
-                    passenger_text = page.locator(f"text={DEFAULT_PASSENGER}").first
-                    if passenger_text.count() > 0:
-                        # 向上查找包含checkbox的容器
-                        parent_with_checkbox = passenger_text.locator("xpath=ancestor::*[.//input[@type='checkbox']]").first
-                        if parent_with_checkbox.count() > 0:
-                            cb = parent_with_checkbox.locator("input[type='checkbox']").first
-                            if cb.count() > 0:
-                                if not cb.is_checked():
-                                    try:
-                                        cb.check(force=True, timeout=2000)
-                                    except:
-                                        cb.click(force=True, timeout=2000)
-                                    time.sleep(0.8)
-                                    if cb.is_checked():
-                                        passenger_selected = True
-                                        log("[OK] 已通过方法2勾选乘车人")
-                                else:
-                                    passenger_selected = True
-                                    log("[OK] 乘车人已勾选")
-                except Exception as e:
-                    log(f"[WARN] 方法2失败: {str(e)}")
-            
-            # 方法3: 尝试通过XPath精确定位
-            if not passenger_selected:
-                log("[INFO] 方法3: 使用XPath精确定位...")
-                try:
-                    # XPath: 查找包含乘车人姓名的文本节点，然后查找同一容器中的checkbox
-                    xpath_selector = f"//*[contains(text(), '{DEFAULT_PASSENGER}')]/ancestor::*[.//input[@type='checkbox']]//input[@type='checkbox']"
-                    cb = page.locator(f"xpath={xpath_selector}").first
-                    if cb.count() > 0:
-                        if not cb.is_checked():
-                            try:
-                                cb.check(force=True, timeout=2000)
-                            except:
-                                cb.click(force=True, timeout=2000)
-                            time.sleep(0.8)
+                            # 验证是否勾选成功
                             if cb.is_checked():
                                 passenger_selected = True
-                                log("[OK] 已通过方法3勾选乘车人")
-                        else:
-                            passenger_selected = True
-                            log("[OK] 乘车人已勾选")
-                except Exception as e:
-                    log(f"[WARN] 方法3失败: {str(e)}")
+                                log(f"[OK] 已成功勾选乘车人 '{DEFAULT_PASSENGER}'")
+                                break
+                except:
+                    continue
             
         except Exception as e:
             log(f"[WARN] 选择乘车人过程出错: {str(e)}")
-            import traceback
-            traceback.print_exc()
         
         # 验证是否选择成功
         if not passenger_selected:
-            log("[FAIL] 未能成功选择乘车人")
-            log("[INFO] 尝试查找所有可用的checkbox/radio...")
-            try:
-                all_inputs = page.locator("input[type='checkbox'], input[type='radio']")
-                input_count = all_inputs.count()
-                log(f"[DEBUG] 页面共有 {input_count} 个checkbox/radio")
-                for idx in range(min(input_count, 10)):  # 只显示前10个
-                    try:
-                        inp = all_inputs.nth(idx)
-                        is_checked = inp.is_checked()
-                        nearby = inp.locator("xpath=ancestor::tr | ancestor::li | ancestor::label").first
-                        nearby_text = nearby.inner_text(timeout=1000)[:50] if nearby.count() > 0 else "N/A"
-                        log(f"  [{idx+1}] checked={is_checked}, nearby_text={nearby_text}")
-                    except:
-                        pass
-            except:
-                pass
-            
-            # 保存截图以便调试
-            page.screenshot(path="passenger_selection_failed.png", full_page=True)
-            log("[INFO] 已保存截图: passenger_selection_failed.png")
-            
-            # 询问是否继续（可能手动选择）
-            log("[WARN] 请手动选择乘车人后，程序将继续...")
-            time.sleep(5)  # 给用户5秒时间手动选择
-
-        # 提交前再次验证乘车人是否已选择
-        log("[STEP] 验证乘车人是否已选择...")
-        checked_count = page.locator("input[type='checkbox']:checked, input[type='radio']:checked").count()
-        if checked_count == 0:
-            log("[FAIL] 未检测到已选择的乘车人，请手动选择后再试")
-            log("[INFO] 程序将等待10秒，请手动选择乘车人...")
-            time.sleep(10)
-            # 再次检查
-            checked_count = page.locator("input[type='checkbox']:checked, input[type='radio']:checked").count()
-            if checked_count == 0:
-                log("[FAIL] 仍然未检测到已选择的乘车人，退出程序")
-                page.screenshot(path="no_passenger_selected.png", full_page=True)
-                log("[INFO] 已保存截图: no_passenger_selected.png")
+            # 再次检查是否已勾选（可能已经勾选但标志未更新）
+            checked_count = page.locator("input[type='checkbox']:checked").count()
+            if checked_count > 0:
+                log(f"[OK] 检测到 {checked_count} 个已选择的乘车人")
+                passenger_selected = True
+            else:
+                log("[FAIL] 未能成功选择乘车人，退出程序")
+                page.screenshot(path="passenger_selection_failed.png", full_page=True)
+                log("[INFO] 已保存截图: passenger_selection_failed.png")
                 browser.close()
                 return
-            else:
-                log(f"[OK] 检测到 {checked_count} 个已选择的乘车人")
         else:
+            # 验证勾选状态
+            checked_count = page.locator("input[type='checkbox']:checked").count()
             log(f"[OK] 检测到 {checked_count} 个已选择的乘车人")
         
         log("[STEP] 点击提交订单（将生成待支付订单）")
-        # 不做支付，只点提交
-        try:
-            submit_button = page.get_by_role("button", name="提交订单")
-            if submit_button.count() > 0:
-                submit_button.click(timeout=10000)
-                log("[OK] 已点击提交订单按钮")
-            else:
-                raise PWTimeout("未找到button类型的提交按钮")
-        except PWTimeout:
+        submit_selectors = [
+            "a:has-text('提交订单')",  # 最常用的选择器
+            "button:has-text('提交订单')",
+            "a:has-text('提交')",
+            "button:has-text('提交')",
+        ]
+        
+        submit_clicked = False
+        for selector in submit_selectors:
             try:
-                submit_link = page.locator("a:has-text('提交订单')")
-                if submit_link.count() > 0:
-                    submit_link.click(timeout=10000)
-                    log("[OK] 已点击提交订单链接")
-                else:
-                    # 尝试其他可能的提交按钮文本
-                    submit_selectors = [
-                        "button:has-text('提交')",
-                        "a:has-text('提交')",
-                        "#submitOrder_id",
-                        ".submit-btn",
-                        "[onclick*='submit']",
-                    ]
-                    clicked = False
-                    for selector in submit_selectors:
+                btn = page.locator(selector).first
+                if btn.count() > 0:
+                    btn.click(timeout=10000)
+                    log(f"[OK] 已点击提交订单（选择器: {selector}）")
+                    submit_clicked = True
+                    break
+            except:
+                continue
+        
+        if not submit_clicked:
+            log("[FAIL] 未找到提交订单按钮")
+            page.screenshot(path="submit_button_not_found.png", full_page=True)
+            log("[INFO] 已保存截图: submit_button_not_found.png")
+            browser.close()
+            return
+
+        # 等待结果：可能出现跳转到支付页/订单列表页，或者弹窗提示，或者核对页面
+        time.sleep(3)
+        page.wait_for_load_state("domcontentloaded", timeout=10000)
+        time.sleep(2)
+        
+        current_url = page.url
+        log(f"[INFO] 提交后当前URL: {current_url}")
+        
+        # 检查是否进入核对页面（通常URL包含 confirmPassenger/confirmSingleForQueue 或类似）
+        # 或者页面中有"核对"、"确认"等文本
+        is_confirm_page = False
+        confirm_page_indicators = [
+            "confirmPassenger/confirmSingleForQueue",
+            "confirmPassenger/confirm",
+            "核对",
+            "确认订单信息",
+        ]
+        
+        for indicator in confirm_page_indicators:
+            if indicator in current_url or page.locator(f"text={indicator}").count() > 0:
+                is_confirm_page = True
+                log(f"[INFO] 检测到核对页面（指示器: {indicator}）")
+                break
+        
+        # 如果在核对页面，需要点击确认按钮
+        if is_confirm_page:
+            log("[STEP] 在核对页面，点击确认按钮...")
+            confirm_clicked = False
+            
+            # 优先使用已知有效的选择器
+            confirm_selectors = [
+                "#qr_submit_id",  # 已知有效的选择器
+                "a:has-text('提交订单')",
+                "a:has-text('确认')",
+                "button:has-text('确认')",
+                "#confirm_id",
+                "a.btn72",
+            ]
+            
+            for selector in confirm_selectors:
+                try:
+                    confirm_btn = page.locator(selector).first
+                    if confirm_btn.count() > 0:
                         try:
-                            btn = page.locator(selector).first
-                            if btn.count() > 0 and btn.is_visible(timeout=2000):
-                                btn.click()
-                                log(f"[OK] 已点击提交按钮（选择器: {selector}）")
-                                clicked = True
-                                break
+                            confirm_btn.scroll_into_view_if_needed()
+                            time.sleep(0.5)
+                        except:
+                            pass
+                        
+                        # 尝试点击（如果不可见则强制点击）
+                        try:
+                            if confirm_btn.is_visible(timeout=2000):
+                                confirm_btn.click(timeout=5000)
+                            else:
+                                confirm_btn.click(force=True, timeout=5000)
+                            log(f"[OK] 已点击确认按钮（选择器: {selector}）")
+                            confirm_clicked = True
+                            break
                         except:
                             continue
-                    if not clicked:
-                        raise PWTimeout("未找到提交订单按钮")
-            except PWTimeout:
-                log("[FAIL] 未找到提交订单按钮")
-                page.screenshot(path="submit_button_not_found.png", full_page=True)
-                log("[INFO] 已保存截图: submit_button_not_found.png")
-                browser.close()
-                return
-
-        # 等待结果：可能出现跳转到支付页/订单列表页，或者弹窗提示
-        time.sleep(5)
-        log(f"[INFO] 提交后当前URL: {page.url}")
-
+                except:
+                    continue
+            
+            if confirm_clicked:
+                # 等待确认后的结果
+                time.sleep(5)
+                page.wait_for_load_state("domcontentloaded", timeout=10000)
+                time.sleep(2)
+        
+        # 检查最终结果
+        final_url = page.url
+        
+        # 检查是否成功生成订单（通常会有订单号或跳转到订单列表）
+        success_indicators = [
+            "orderId",
+            "order_id",
+            "订单号",
+            "待支付",
+            "订单列表",
+            "myOrder",
+        ]
+        
+        order_success = False
+        for indicator in success_indicators:
+            if indicator in final_url or page.locator(f"text={indicator}").count() > 0:
+                order_success = True
+                log(f"[OK] 检测到订单成功生成（指示器: {indicator}）")
+                break
+        
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         screenshot = f"playwright_submit_{ts}.png"
         page.screenshot(path=screenshot, full_page=True)
         log(f"[INFO] 已截图: {screenshot}")
 
-        log("[STOP] 已执行提交订单动作：请在手机端检查待支付订单（可付款或取消）")
+        if order_success:
+            log("[OK] 已成功生成待支付订单，请在手机端检查待支付订单（可付款或取消）")
+        else:
+            log("[WARN] 未明确检测到订单成功生成，请在手机端检查待支付订单（可付款或取消）")
+        
         browser.close()
 
 

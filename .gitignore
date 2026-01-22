@@ -20,7 +20,9 @@ wheels/
 .installed.cfg
 *.egg
 .playwright*
-pw-data/*
+pw-data/
+pw-browsers/
+cookies.json
 
 # Virtual Environment
 venv/
