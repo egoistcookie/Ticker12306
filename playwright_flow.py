@@ -810,7 +810,8 @@ def main():
                     log(f"[INFO] 找到预订按钮（方法: {method}, 选择器: {selector}）")
                     # 滚动到按钮位置，确保可见
                     btn.scroll_into_view_if_needed()
-                    time.sleep(0.5)
+                    # 增加延迟，模拟人类操作
+                    time.sleep(2)
                     btn.click(timeout=5000)
                     log("[OK] 已点击预订按钮")
                     booking_clicked = True
@@ -842,6 +843,8 @@ def main():
                 
                 # 检查常见的提示文本
                 alert_selectors = [
+                    "text=网络可能存在问题",
+                    "text=请您重试一下",
                     "text=系统繁忙",
                     "text=请先登录",
                     "text=登录已失效",
